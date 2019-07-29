@@ -1,0 +1,520 @@
+#!/usr/bin/php
+<?php
+
+/* 
+ * To change this license header, choose License Headers in Project Properties.
+ * To change this template file, choose Tools | Templates
+ * and open the template in the editor.
+ * 
+ * 
+ * 
+ * 
+ * 
+ * TODOs:  
+ * 
+ * 1.)  There is a lag between when udev fires-off the udev rule to call this
+ * script and when the partition information is available from lsblk.  We need
+ * to introduce some checking or pause.  If we don't then we don't have any 
+ * partition info from lsblk and the resulting partitions in the db get deleted.
+ * 
+ * 2.)  Don't just blindly mark partitions as mounted.  Check for sure before
+ * marking them as such in the db.
+ * 
+ * 3.)  For the device table rename "name" field to "dev_path" for the device path.
+ * and create a new field "name" that will store the user_defined name.  The name
+ * field will be a hash of the vendor, model, and serial if no name is specified.
+ * 
+ * 4.)  Rename the "name" field in the partition table to "partition".
+ */
+
+require_once __DIR__."/../vendor/autoload.php";
+require_once __DIR__."/../includes/Misc.php";
+require_once __DIR__."/../includes/db/MariaDbWrapper.php";
+require_once __DIR__."/../conf/db.php";
+
+use Monolog\Logger;
+use Monolog\Handler\StreamHandler;
+
+$this_file = basename(__FILE__);
+$partitions_array = array();
+$actions_available = array("add", "remove");
+$dev_types_available = array("disk", "partition");
+
+$log = new Logger($this_file);
+$log->pushHandler(new StreamHandler(__DIR__."/../logs/".$this_file.".log", Logger::DEBUG));
+
+if(sizeof($argv) !== 4)
+{
+    $log->err("Improper usage of script: ".print_usage());
+    exit(1);
+}
+
+$action = trim($argv[1]);
+$dev_type = trim($argv[2]);
+$dev_path = trim($argv[3]);
+
+//$log->info("Scripted called!!!!:  ACTION:".$action. "  DEV_TYPE: ".$dev_type."  DEV_PATH:".$dev_path);
+
+if(!in_array($action, $actions_available))
+{
+    $log->err("Unsupported action: ".$action.".");
+    exit(1);
+}
+
+if(!in_array($dev_type, $dev_types_available))
+{
+    $log->err("Unsupported dev_type:".$dev_type.".");
+    exit(1);
+}
+
+/*
+ * Make sure the dev_path was not a partition.  Fail if the dev_path passed
+ * ends in a digit(number).
+ */
+if($dev_type == "disk" && preg_match("/\d+$/", $dev_path) === 1)
+{
+    $err_message = "You must specify a device path, not a partiion path when using dev_type='disk'.  You specified: ".$dev_path;
+    echo "\n"."ERROR: ".$err_message."\n\n";
+    $log->emerg($err_message);
+    exit(1);
+}
+
+// Connect to our DB.
+$db_obj = new MariaDbWrapper($db_host, $db_user, $db_password, $db_name);
+if(!is_object($db_obj))
+{
+    $log->err("Could not connect to database: ".$db_name." on host: ".$db_host.".  Failed to create db object needed for ".$this_file.".");
+    exit(1);
+}
+
+if($action == "add")
+{
+    if(add($dev_type, $dev_path))
+    {
+        $log->info("Device: ".$dev_path. " is now ready to be used for backups.");
+    }
+    else
+    {
+        $log->err("Failed to add device: ".$dev_path." to the database.  See logs for more info.");
+    }
+}
+else if ($action == "remove")
+{
+    if(remove($dev_type, $dev_path))
+    {
+        $log->info("Device: ".$dev_path." removed from system and successfully disabled in the database.");
+    }
+    else
+    {
+        $log->err("Device: ".$dev_path." removed from system but failed to disable it in the database.  Please investigate why");
+    }
+}
+else
+{
+    $log->err("Unsupported action: ".$action.".");
+    exit(1);
+}
+
+
+// Failsafe catch-all.
+exit(0);
+
+
+
+
+/*
+ * Recursevily walk all of the available partitions to get the data we need.
+ */
+function walk_lsblk($json_decoded_object)
+{
+    $partitions_array = array();
+    
+    if(is_array($json_decoded_object))
+    {
+        foreach($json_decoded_object as $this_json_object)
+        {
+            // We hit the root/start of the physical device.  Grab it's info. and be done.
+            if($this_json_object->serial !== null)
+            {                
+                $partitions_array["device"] = array("serial" => trim($this_json_object->serial),
+                                                    "vendor" => trim($this_json_object->vendor),
+                                                    "model" => trim($this_json_object->model),
+                                                    "size" => Misc::convertToBytes(trim($this_json_object->size)));
+                return $partitions_array;
+            }
+            
+            if(isset($this_json_object->children))
+            {
+                walk_lsblk($this_json_object->children);
+            }
+            else
+            { 
+                if(isset($this_json_object->name) && $this_json_object->fstype !== null)
+                {
+                    $partitions_array["partitions"][] = array("dev_path" => trim($this_json_object->name), 
+                                                "fstype" => trim($this_json_object->fstype), 
+                                                "label" => trim($this_json_object->label), 
+                                                "uuid" => trim($this_json_object->uuid), 
+                                                "mount_point" => $this_json_object->mountpoint,
+                                                "size" => Misc::convertToBytes(trim($this_json_object->size)));
+                }
+            }
+        }
+        return $partitions_array;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+
+
+function add($dev_type, $dev_path)
+{
+    global $this_file, $log, $db_obj;    
+    
+    $host_bean = $db_obj->findOne("host", " name = :name ", array(":name" => gethostname()));
+    if(!is_object($host_bean))
+    {
+        $log->err("Failed to get db information for host:".gethostname().".  Can't add device: ".$dev_path." to db.");
+        return false;
+    }
+    
+    /* 
+     * Grab the UUID, label, etc.  Use lsblk instead of blkid as blkid is not
+     * as reliable and accurate.  See manpage for blkid for more info.
+     */
+    $lsblk_result_array = Misc::runLocalCommand("lsblk -OnpJ ".$dev_path, true);
+    if($lsblk_result_array["return_value"] === 0)
+    {
+        // Turn our output array into an actual JSON string.
+        $lsblk_obj_array = json_decode(implode("\n", $lsblk_result_array["output"]));
+        // Walk our device objects to get their data.
+        $partitions_array = walk_lsblk($lsblk_obj_array->blockdevices);
+        
+        if($partitions_array === false)
+        {
+            $log->err("Failed to decode information for storage device: ".$dev_path."\n");
+            return false;
+        }
+    }
+    else
+    {
+        $log->err("An error occurred while attempting to run command: lsblk -OnJ ".$dev_path.".  Can't proceed further");
+        return false;
+    }
+
+    // Now store the info we discovered in the db or update existing device records.
+    if(sizeof($partitions_array) !== 0)
+    {
+        $now_date = date("Y-m-d H:i:s");
+        
+        if($dev_type == "disk" && isset($partitions_array["device"]))
+        {
+            $storage_bean = $db_obj->findOne("storage", " serial_number = :serial_number ", array(":serial_number" => $partitions_array["device"]["serial"]));
+            
+            if(is_object($storage_bean))
+            {
+                /*
+                 * NOTE: We don't update the device's name since it may have 
+                 * been manually set by the user after initial db creation.
+                 */
+                $storage_bean->date_updated = $now_date;
+                $storage_bean->dev_path = $dev_path;
+                $storage_bean->enabled = "true";
+                
+            }
+            else
+            {
+                /*
+                 * Never seen this device before.  Create new db entries for it and its partitions.
+                 */
+                $storage_bean = $db_obj->createBeans("storage");
+
+                
+                $storage_bean->date_created = $now_date;
+                $storage_bean->date_updated = $now_date;
+                $storage_bean->name = $partitions_array["device"]["vendor"]."_".$partitions_array["device"]["model"]."_".$partitions_array["device"]["serial"];
+                $storage_bean->dev_path = $dev_path;
+                $storage_bean->vendor = $partitions_array["device"]["vendor"];
+                $storage_bean->model = $partitions_array["device"]["model"];
+                $storage_bean->serial_number = $partitions_array["device"]["serial"];
+                $storage_bean->size = $partitions_array["device"]["size"];
+                $storage_bean->enabled = "true";
+                
+                // Set our host in the db that owns this storage device.
+                $storage_bean->host = $host_bean;                
+            }
+            
+            $db_obj->store($storage_bean);
+            return true;            
+        }
+        else if($dev_type == "partition" && isset($partitions_array["partitions"]))
+        {
+            foreach($partitions_array["partitions"] as $this_partition)
+            {
+                // Get the db storage record so we can relate the partitions to their corresponding parent disk.
+                if(preg_match("/^(\\/dev\\/.*)\d+/", $this_partition["dev_path"], $matches) === 1)
+                {
+                    $storage_bean = $db_obj->findOne("storage", " dev_path = :dev_path ", array(":dev_path" => $matches[1]));
+                }
+            
+                if(is_object($storage_bean))
+                {
+                    /*
+                     * Now we need to determine if the partition info for this device is
+                     * the same for when we last used it.  If not, remove the old partition
+                     * info from the db and add the new stuff.
+                     */
+                    if(is_array($storage_bean->ownPartitionList) && sizeof($storage_bean->ownPartitionList) > 0)
+                    {
+                        foreach($storage_bean->ownPartitionList as $this_partition_bean)
+                        {
+                            $found_partition = false;
+                            if($this_partition["uuid"] == $this_partition_bean->uuid)
+                            {
+                                $found_partition = true;
+                                /*
+                                 * Update this partition's db settings as enabled 
+                                 * and set its name and new mount point.
+                                 */
+                                $is_mounted = "false";
+                                if($this_partition["mount_point"] === null)
+                                {
+                                    // Attempt to manually mount the partition.
+                                    $mount_point = mount($this_partition["uuid"]);
+                                    if($mount_point !== false)
+                                    {
+                                        $this_partition["mount_point"] = $mount_point;
+                                        $is_mounted = "true";
+                                        $log->info("Successfully manually mounted partition: ".$dev_path.".");
+                                    }
+                                    else
+                                    {
+                                        $log->info("Failed to manually mount partition: ".$dev_path.".");
+                                    }
+                                }
+                                $this_partition_bean->mount_point = $this_partition["mount_point"];
+                                $this_partition_bean->date_updated = $now_date;
+                                $this_partition_bean->dev_path = $this_partition["dev_path"];
+                                $this_partition_bean->is_mounted = $is_mounted;
+                                $this_partition_bean->enabled = "true";
+                                break;                                
+                            }
+                        }
+                        
+                        if(!$found_partition)
+                        {
+                            if(add_partition_to_db($storage_bean, $this_partition))
+                            {
+                                $log->info("Successfully added partition: ".$dev_path." to the db.");
+                            }
+                            else
+                            {
+                                $log->err("Failed to add partition: ".$this_found_partition["name"]. " to db.  See logs for more details.");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if(add_partition_to_db($storage_bean, $this_partition))
+                        {
+                            $log->info("Successfully added partition: ".$dev_path." to the db.");
+                        }
+                        else
+                        {
+                            $log->err("Failed to add partition: ".$this_found_partition["name"]. " to db.  See logs for more details.");
+                        }
+                    }
+                    $db_obj->store($storage_bean);
+                }
+                else
+                {
+                    $log->err("Could not find parent device for partition: ".$dev_type.".");
+                }
+            }
+            return true;
+        }
+    }
+    else
+    {
+        $log->err("No device and/or partition info gathered for device: ".$dev_path);
+        return false;
+    }
+}
+
+function add_partition_to_db($storage_bean, $partition_info_array)
+{
+    global  $db_obj, $log;
+    
+    $now_date = date("Y-m-d H:i:s");
+    
+    $partition_type_bean = $db_obj->findOne("formattype", " name = :name ", array(":name" => $partition_info_array["fstype"]));   
+    if(!is_object($partition_type_bean))
+    {
+        $log->err("Unsupported filesystem type: ".$partition_info_array["fstype"]." on device: ".$dev_path.".");
+        return false;
+    }
+    
+    // Now create the partition db entries.
+    $partition_bean = $db_obj->createBeans("partition");
+    
+    $is_mounted = "false";
+    if($partition_info_array["mount_point"] === null)
+    {
+        $mount_point = mount($partition_info_array["uuid"]);
+        if($mount_point !== false)
+        {
+            $partition_info_array["mount_point"] = $mount_point;
+            $is_mounted = "true";
+            $log->info("Successfully manually mounted partition: ".$partition_info_array["dev_path"]);
+        }
+        else
+        {
+            $log->err("Failed to manually mount partition: ".$partition_info_array["dev_path"]); 
+            $is_mounted = "false";
+        }
+
+    }
+    else
+    {
+        $is_mounted = "true";
+    }
+
+    $partition_bean->date_created = $now_date;
+    $partition_bean->date_updated = $now_date;
+    $partition_bean->storage = $storage_bean;
+    $partition_bean->name = $partition_info_array["label"];
+    $partition_bean->dev_path = $partition_info_array["dev_path"];
+    $partition_bean->mount_point = $partition_info_array["mount_point"];
+    $partition_bean->uuid = $partition_info_array["uuid"];
+    $partition_bean->label = $partition_info_array["label"];
+    $partition_bean->formattype_id = $partition_type_bean->id;
+    $partition_bean->size = $partition_info_array["size"];
+    $partition_bean->is_mounted = $is_mounted;
+    $partition_bean->automount_subsys = "udisk";
+    $partition_bean->enabled = "true";
+    
+    
+    $db_obj->store($partition_bean);
+    return true;
+}
+
+
+
+function remove($dev_type, $dev_path)
+{
+    /*
+     * When removing devices or partitions we simply mark them as disabled.  We
+     * never remove their entries from the db in case these devices are re-inserted
+     * at a later date.
+     */
+    global $this_file, $log, $db_obj;
+    
+    $now_date = date("Y-m-d H:i:s");
+    
+    if($dev_type == "disk")
+    {
+        /*
+         * Simply mark all device and all of its partitions disabled and
+         * unmounted in the db.
+         */
+        $storage_bean = $db_obj->findOne("storage", " dev_path = :dev_path ", array(":dev_path" => $dev_path));
+        if(is_object($storage_bean))
+        {
+            $storage_bean->date_updated = $now_date;
+            $storage_bean->dev_path = null;
+            $storage_bean->enabled = "false";
+
+            /*
+             * Mark the disks associated partitions as disabled also.
+             */
+            foreach($storage_bean->ownPartitionList as $this_partition_bean)
+            {
+                $this_partition_bean->date_updated = $now_date;
+                $this_partition_bean->dev_path = null;
+                $this_partition_bean->mount_point = null;
+                $this_partition_bean->is_mounted = "false";
+                $this_partition_bean->enabled = "false";
+            }
+            // Update our db records with the above settings.
+            $db_obj->store($storage_bean);
+            return true;
+        }
+        else
+        {
+            $log->err("Unable to find storage device: ".$dev_path." in db.  Can't mark the device as offline.  Please do it manually.");
+            return false;
+        } 
+    }
+    else if($dev_type == "partition")
+    {
+        $partition_bean = $db_obj->findOne("partition", " dev_path = :dev_path ", array(":dev_path" => $dev_path));
+        if(is_object($partition_bean))
+        {
+            $partition_bean->date_updated = $now_date;
+            $partition_bean->dev_path = null;
+            $partition_bean->mount_point = null;
+            $partition_bean->is_mounted = "false";
+            $partition_bean->enabled = "false";
+            
+            $db_obj->store($partition_bean);
+            return true;
+        }
+        else
+        {
+            $log->err("Unabled to find partition: ".$dev_path." in db.  Can't mark the partition as offline.  Please do it manually.");
+            return false;
+        }
+    }
+    
+    
+}
+
+/*
+ * Returns the mount point or false otherwise.
+ */
+function mount($uuid)
+{
+    /*
+     * Determine if this disk is in the /etc/fstab file.
+     */
+    $return_value = Misc:: runLocalCommand("grep ".$uuid." /etc/fstab");
+    if(!empty($return_value))
+    {
+        preg_match_all("/(\S+)\s{0,}/", $return_value, $fstab_array, PREG_OFFSET_CAPTURE);
+        if(sizeof($fstab_array > 0))
+        {
+            $return_array = Misc::runLocalCommand("mount ".$fstab_array[1][1][0], true);
+            if($return_array["return_value"] === 0)
+            {
+                return $fstab_array[1][1][0];
+            }
+            else
+            {
+                return false;
+            }
+        }
+        else
+        {
+            return false;
+        }
+    }
+    
+    
+    
+}
+
+
+function print_usage()
+{
+    global $this_file;
+    
+    echo "\nUsed to add new backup devices to the virbak database.\n"
+        . "It is usually called via a udev rule.\n\n"
+        . $this_file." [action] [dev_type] [dev_path]\n"
+        . "\t[action] = add|remove\n"
+        . "\devpath - the device path.  I.E. /devices/pci0000:00/0000:00:14.0/usb4...\n\n";
+}
+

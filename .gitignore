@@ -1,0 +1,11 @@
+composer.lock
+logs/
+nbproject/
+proto.php
+qemu-disk-info.txt
+system.php
+test_libvirt-php.php
+backups/
+bin/crypt*
+bin/proto.php
+includes/third_party/cli-menu

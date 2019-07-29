@@ -1,0 +1,461 @@
+#!/usr/bin/php
+<?php
+
+/* 
+ * To change this license header, choose License Headers in Project Properties.
+ * To change this template file, choose Tools | Templates
+ * and open the template in the editor.
+ */
+
+require_once __DIR__."/../vendor/autoload.php";
+require_once __DIR__."/../includes/Misc.php";
+require_once __DIR__."/../includes/db/DbAbstract.php";
+require_once __DIR__."/../conf/db.php";
+require_once __DIR__.'/../includes/libvirt/LibVirt.php';
+require_once __DIR__."/../includes/third_party/Cryptor.php";
+require_once __DIR__."/../includes/Schedule/Schedule.php";
+require_once __DIR__."/../includes/Schedule/BackupScheduler.php";
+require_once __DIR__."/../../conf/db.php";
+
+use Monolog\Logger;
+use Monolog\Handler\StreamHandler;
+
+// Include all of our storage classes.
+foreach (glob(__DIR__."/../includes/storage/*.php") as $filename)
+{
+    include_once $filename;
+}
+
+// Setup our logging facilities.
+$log = new Logger(basename(__FILE__));
+$log->pushHandler(new StreamHandler(__DIR__."/../logs/".basename(__FILE__).".log", Logger::DEBUG));
+
+
+DbAbstract::connect("MariaDbWrapper", $db_host, $db_user, $db_password, $db_name);
+$scheduler_obj = null;
+$hive = [];
+
+$hive["scheduler"] = $scheduler_obj = new BackupScheduler();
+
+while(true)
+{
+    $host_beans = DbAbstract::find("host", " enabled = ? ", ["true"]);
+    foreach($host_beans as $this_host_bean)
+    {
+        if(isset($hive["hosts"][$this_host_bean->name]["libvirt"]))
+        {
+            $libvirt_obj = $hive["hosts"][$this_host_bean->name]["libvirt"];
+        }
+        else
+        {
+            $libvirt_obj = new LibVirt("qemu:///".$this_host_bean->name);
+            $hive["hosts"][$this_host_bean->name]["libvirt"] = $libvirt_obj;
+        }
+        inspect_vms($libvirt_obj);
+
+        /*
+         * Inspect our storage devices.
+         */
+        $storage_beans_array = $this_host_bean->ownStorageList;
+        foreach($storage_beans_array as $storage_bean)
+        {
+            if(!Misc::castStringToBool($storage_bean->enabled))
+            {
+                /*
+                 * TODO:  Need to check if any partitions for these storage devices
+                 * are currently mounted, and if so unmount and disable them.
+                 */
+                continue;
+            }
+            $partition_beans = $storage_bean->ownPartitionList;
+            foreach($partition_beans as $partition_bean)
+            {
+                // We only deal with "enabled" partitions.
+                if(!Misc::castStringToBool($partition_bean->enabled))
+                {
+                    /*
+                    * TODO:  Need to check if any partitions for these storage devices
+                    * are currently mounted, and if so unmount and disable them.
+                    */
+                    continue;
+                }
+                if(!isset($hive["hosts"][$this_host_bean->name]["storage"][$storage_bean->name][$partition_bean->label]))
+                {
+                    try
+                    {
+                        $storage_obj = prepare_storage_device($this_host_bean, $storage_bean, $partition_bean);
+                        $hive["hosts"][$this_host_bean->name]["storage"][$storage_bean->name][$partition_bean->label] = $storage_obj;
+                        $log->info("Backup partition: ".$storage_obj->getLabel()." is now attached to host: ". $this_host_bean->name." and ready for backups.");
+
+                    }
+                    catch(Exception $e)
+                    {
+                        $log->addCritical($e->getMessage());
+                    }
+                }
+                else
+                {
+                    $storage_obj = $hive["hosts"][$this_host_bean->name]["storage"][$storage_bean->name][$partition_bean->label];
+                    if(!$storage_obj->isMounted())
+                    {
+                        if($storage_obj->isDeviceAttached($partition_bean->uuid))
+                        {
+                            $log->info("Attempting to re-mount backup partition: ".$storage_obj->getLabel()."...");
+                            try
+                            {
+                                $storage_obj->activate();
+                                if($storage_obj->mount())
+                                {
+                                    $partition_bean->is_mounted = "true";
+                                }
+                                else
+                                {
+                                    $partition_bean->is_mounted = "false";
+                                }
+                            } 
+                            catch (Exception $e) 
+                            {
+                                $log->crit("Failed to mount backup partition: ".$storage_obj->getLabel().".  Caught Exception: ".$e->getMessage());
+                                $partition_bean->is_mounted = "false";
+                            }
+                        }
+                        else
+                        {
+                            $log->crit("Backup device containing partition: ".$partition_bean->label." is not attached to the host:". $this_host_bean->name.
+                                    ".  All backups using this device will be disabled.");
+                            
+                            // Invalidate the storage object since it's not attached to the system.
+                            unset($hive["hosts"][$this_host_bean->name]["storage"][$storage_bean->name]);
+                            
+                            $partition_bean->is_mounted = "false";
+                            $partition_bean->dev_path = null;
+                            $partition_bean->mount_point = null;
+                            $storage_bean->dev_path = null;
+                            $storage_bean->state = "offline";
+                            DbAbstract::store([$partition_bean, $storage_bean]);
+                        }
+                    }
+                    else
+                    {
+                        $partition_bean->is_mounted = "true";
+                        $storage_bean->state = $storage_obj->getState();
+                        DbAbstract::store([$partition_bean, $storage_bean]);
+                    }
+                }
+            }
+        }
+        
+        
+        /*
+         * Determine what needs to be backed up and kick it off.
+         * 
+         * MIKE, WE LEFT OFF HERE.  TODO:
+         * 1.) Do we send Schedule obj to the Backup constructor or do we
+         * send Backup obj to the Schedule constructor.  I.E. Do we eventually
+         * add Backup objects to the Scheduluer or do we add Schedule objects
+         * to the Scheduler?
+         * 
+         * 
+         */
+        $libvirt_obj = $hive["hosts"][$this_host_bean->name]["libvirt"];
+        foreach($this_host_bean->ownDomainList as $this_domain_bean)
+        {
+            if($libvirt_obj->isDomainActive($this_domain_bean->name))
+            {
+                foreach($this_domain_bean->ownBackupList as $this_backup_bean)
+                {
+
+                }
+            }
+        }
+        
+        
+    }
+    sleep(60);
+}
+
+exit(0);
+
+
+
+if(!prereqs())
+{
+    $log->addCritical("Failed to complete prerequisites.  Can't continue.");
+    exit(1);
+}
+
+$vm_blk_info_array = $libvirt_obj->dumpDomainsInfo();
+//var_dump($vm_blk_info_array);
+$qstorage_ids = $libvirt_obj->getQemuStorageIds("Neon");
+var_dump($qstorage_ids);
+exit(0);
+
+function inspect_vms(LibVirt $libvirt_obj)
+{
+    global  $rb,
+            $log;
+    
+    $domains_array = $libvirt_obj->listDomains();
+    foreach($domains_array as $this_domain)
+    {
+        $domain_bean = DbAbstract::findOne("domain", " name = ? ", [$this_domain]);
+        if($libvirt_obj->isDomainActive($this_domain))
+        {
+            $domain_bean->status = "online";
+
+            try
+            {
+                $qemu_stor_obj_array = $libvirt_obj->getQemuStorageInfo($this_domain);
+            }
+            catch(Exception $e)
+            {
+                $log->addError($e->getMessage());
+                continue;
+            }
+            foreach($qemu_stor_obj_array as $this_qemu_stor_obj)
+            {
+                $found = false;
+                foreach($domain_bean->ownVdiskList as $this_vdisk)
+                {
+                    if($this_vdisk->name == $this_qemu_stor_obj->getName() && $this_vdisk->file == $this_qemu_stor_obj->getFilename())
+                    {
+                        $found = true;
+
+                        $this_vdisk->io_status = $this_qemu_stor_obj->getIoStatus();
+                        $this_vdisk->size_virtual = $this_qemu_stor_obj->getVirtualSize();
+                        $this_vdisk->size_actual = $this_qemu_stor_obj->getActualSize();
+                        $this_vdisk->dirty_flag = Misc::castBoolToString($this_qemu_stor_obj->isDirty());
+                        DbAbstract::store($this_vdisk);
+                    }
+                }
+                if(!$found)
+                {
+                    // Add the new vdisk to the database.
+                    $vdisk_bean = DbAbstract::createBeans("vdisk");
+                    $vdisk_bean->io_status = $this_qemu_stor_obj->getIoStatus();
+                    $vdisk_bean->size_virtual = $this_qemu_stor_obj->getVirtualSize();
+                    $vdisk_bean->size_actual = $this_qemu_stor_obj->getActualSize();
+                    $vdisk_bean->dirty_flag = Misc::castBoolToString($this_qemu_stor_obj->isDirty());
+                    DbAbstract::store($vdisk_bean);
+                }
+            }
+        }
+        else
+        {
+            $domain_bean->status = "offline";
+        }
+        DbAbstract::store($domain_bean);
+    }
+    return true;
+}
+
+function prepare_storage_device(RedBeanPHP\OODBBean $host_bean, 
+                                 RedBeanPHP\OODBBean $storage_bean = null, 
+                                 RedBeanPHP\OODBBean $partition_bean = null) : Storage
+{
+    global  $rb,
+            $log;
+        
+    if(!Storage::isDeviceAttached($partition_bean->uuid))
+    {
+        $partition_bean->is_mounted = "false";
+        $partition_bean->dev_path = null;
+        $partition_bean->mount_point = null;
+        $partition_bean->label = null;
+        $partition_bean->notes = "Not attached.";
+        DbAbstract::store($partition_bean);
+
+        $storage_bean->dev_path = null;
+        $storage_bean->size = -1;
+        $storage_bean->notes = "Not attached.";
+        $storage_bean->state = "offline";
+        DbAbstract::store($storage_bean);
+
+        throw new Exception("Backup device ".$storage_bean->name." can't be found.  Is it attached to the system?");
+    }
+
+    // Used mainly for logging and updating the db.
+    $physical_dev_name = Storage::getPhysicalDevName($partition_bean->uuid);
+
+    $storage_obj = null;
+    if($storage_bean->bus_type == "usb")
+    {
+        if(Misc::castStringToBool($partition_bean->encrypted))
+        {
+            if($storage_bean->passphrase !== "")
+            {
+                /*
+                 * Import our keys so we can decrypt certain db entries.
+                 */
+                require_once __DIR__."/../conf/private/keys.php";
+
+                try
+                {
+                    if(Misc::castStringToBool($partition_bean->lvm))
+                    {   
+                        $storage_obj = new LvmEncryptedUsbRemovableStorage($partition_bean->uuid, 
+                                                                            ioncube\phpOpensslCryptor\Cryptor::Decrypt($partition_bean->passphrase, $db_entries_key));
+                    }
+                    else
+                    {
+                        $storage_obj = new EncryptedUsbRemovableStorage($partition_bean->uuid, 
+                                                                            ioncube\phpOpensslCryptor\Cryptor::Decrypt($partition_bean->passphrase, $db_entries_key));
+                    }
+                }
+                catch(Exception $e)
+                {
+                    $msg = "Failed to create object for UUID: ".$partition_bean->uuid."  Caught Exception was: ".$e->getMessage();
+                    $partition_bean->is_mounted = "false";
+                    $partition_bean->dev_path = null;
+                    $partition_bean->mount_point = null;
+                    $partition_bean->label = null;
+                    $partition_bean->notes = $msg;
+                    DbAbstract::store($partition_bean);
+
+                    $storage_bean->dev_path = $physical_dev_name;
+                    $storage_bean->notes = null;
+                    $storage_bean->state = "running";
+                    DbAbstract::store($storage_bean);
+
+                    throw new Exception($msg);
+                }
+
+            }
+            else
+            {
+                $msg = "No passphrase specified for encrypted partition:".$partition_bean->label."(".$partition_bean->uuid.").  Can't use this partition for backups.";
+                $partition_bean->is_mounted = "false";
+                $partition_bean->dev_path = null;
+                $partition_bean->mount_point = null;
+                $partition_bean->label = $msg;
+                $partition_bean->notes = $msg;
+                DbAbstract::store($partition_bean);
+
+                $storage_bean->dev_path = $physical_dev_name;
+                $storage_bean->notes = null;
+                $storage_bean->state = "running";
+                DbAbstract::store($storage_bean);
+
+                throw new Exception($msg);
+            }
+        }
+        else
+        {
+            try
+            {
+                $storage_obj = new UsbRemovableStorage($partition_bean->uuid);
+            }
+            catch(Exception $e)
+            {
+                $msg = "Failed to create object for UUID: ".$partition_bean->uuid."  Caught Exception was: ".$e->getMessage();
+                $partition_bean->is_mounted = "false";
+                $partition_bean->dev_path = null;
+                $partition_bean->mount_point = null;
+                $partition_bean->label = null;
+                $partition_bean->notes = $msg;
+                DbAbstract::store($partition_bean);
+
+                $storage_bean->dev_path = $physical_dev_name;
+                $storage_bean->notes = null;
+                $storage_bean->state = "running";
+                DbAbstract::store($storage_bean);
+
+                throw new Exception($msg);
+            }
+        }
+    }
+    else
+    {
+        $msg = "Failed to find matching class for storage device with UUID of: ".$partition_bean->uuid;
+        $partition_bean->is_mounted = "false";
+        $partition_bean->dev_path = null;
+        $partition_bean->mount_point = null;
+        $partition_bean->label = null;
+        $partition_bean->notes = $msg;
+        DbAbstract::store($partition_bean);
+
+        $storage_bean->dev_path = $physical_dev_name;
+        $storage_bean->notes = null;
+        $storage_bean->state = "running";
+        DbAbstract::store($storage_bean);
+
+        throw new Exception($msg);
+    }
+
+    /*
+     * If we've made it this far then we have created our storage object.
+     */
+    $partition_bean->dev_path = $storage_obj->getPartitionPath();
+    $partition_bean->label = $storage_obj->getLabel();
+    $partition_bean->notes = null;
+
+
+    /*
+     * Only try to mount if not already mounted.
+     */
+    if(!$storage_obj->isMounted())
+    {
+        if($storage_obj->mount())
+        {
+            $partition_bean->is_mounted = "true";
+
+            /*
+             * The mount point is not calculated until the mount()
+             * method is called and is why we wait until here to set
+             * the mount_point for the db record.
+             */
+            $partition_bean->mount_point = $storage_obj->getMountPoint();
+
+            $size = $storage_obj->getSize();
+            if($size !== false)
+            {
+                $partition_bean->size = $size;
+            }
+            else
+            {
+                $partition_bean->size = -1;
+            }
+        }
+        else
+        {
+            $partition_bean->is_mounted = "false";
+        }
+    }
+    else
+    {
+        $partition_bean->is_mounted = "true";
+    }
+
+    $storage_bean->revision = $storage_obj->getRevisionNumber();
+    $storage_bean->dev_path = $storage_obj->getDevicePath();
+    $storage_bean->state = $storage_obj->getState();
+    $storage_bean->size = $storage_obj->getParentSize();
+    $storage_bean->notes = null;
+
+    DbAbstract::store($partition_bean);
+    DbAbstract::store($storage_bean);
+    
+    return $storage_obj;
+}
+
+function prereqs()
+{
+    global  $rb,
+            $log;
+    if(!is_dir(__DIR__."/../keys"))
+    {
+        if(!mkdir(__DIR__."/../keys", 0700))
+        {
+            $log->addCritical("Failed to create keys directory at: ".__DIR__."/../keys");
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+
+
+
+
+
